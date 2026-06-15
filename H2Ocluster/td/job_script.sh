@@ -1,0 +1,411 @@
+#!/bin/bash
+
+
+
+#SBATCH --job-name=(H2O)4_tdl
+
+
+
+#SBATCH --account=van128
+
+
+
+#SBATCH --partition=shared
+
+
+
+#SBATCH --nodes=1
+
+
+
+#SBATCH --ntasks=5
+
+
+
+#SBATCH --ntasks-per-node=5
+
+
+
+#SBATCH --cpus-per-task=1
+
+
+
+#SBATCH --mem-per-cpu=2GB
+
+
+
+#SBATCH --time=47:59:59
+
+
+
+#SBATCH --signal=B:USR1@1800   # 30 Min warning
+
+
+export I_MPI_FABRICS=shm
+
+
+
+
+set -u
+
+
+
+
+
+
+
+############################################
+
+
+
+# Modules (NO line-continuations)
+
+
+
+############################################
+
+
+
+module load cpu/0.17.3b
+
+
+
+module load intel/19.1.3.304/6pv46so
+
+
+
+module load fftw/3.3.10/jq4mbmk
+
+
+
+module load intel-mkl/2020.4.304/vg6aq26
+
+
+
+module load intel-mpi/2019.10.317/ezrfjne
+
+
+
+
+
+
+
+# path to the code you are running
+
+
+
+dftdir=/home/cjiang2/codes/varga_dft_code_parallel/release/
+
+
+
+
+
+
+
+############################################
+
+
+
+# Function to run the code
+
+
+
+############################################
+
+
+
+run_code() {
+
+
+
+    echo "Starting MPI job in scratch..."
+
+
+
+    mpirun -n "$SLURM_NTASKS" "$dftdir/dft" > output 2> error &
+
+
+
+    MPI_PID=$!
+
+
+
+}
+
+
+
+
+
+
+
+############### Nothing below needs to be changed ########
+
+
+
+
+
+
+
+############################################
+
+
+
+# Setup scratch directory
+
+
+
+############################################
+
+
+
+ORIG_DIR="$SLURM_SUBMIT_DIR"
+
+
+
+SCRATCH_BASE="/scratch/$USER/job_$SLURM_JOB_ID"
+
+
+
+
+
+
+
+echo "Creating scratch directory: $SCRATCH_BASE"
+
+
+
+mkdir -p "$SCRATCH_BASE" || exit 1
+
+
+
+
+
+
+
+echo "Copying submit directory to scratch..."
+
+
+
+rsync -a "$ORIG_DIR/" "$SCRATCH_BASE/" || exit 1
+
+
+
+
+
+
+
+cd "$SCRATCH_BASE" || exit 1
+
+
+
+
+
+
+
+############################################
+
+
+
+# Determine absolute ground state path
+
+
+
+############################################
+
+
+
+GS_REL=$(grep -i "gs_path" control.inp | awk -F= '{print $2}' | tr -d ' ')
+
+
+
+if [ -z "$GS_REL" ]; then
+
+
+
+    echo "ERROR: gs_path not found in control.inp"
+
+
+
+    exit 1
+
+
+
+fi
+
+
+
+
+
+
+
+GS_ABS=$(realpath "$ORIG_DIR/$GS_REL")
+
+
+
+echo "Original GS relative path: $GS_REL"
+
+
+
+echo "Absolute GS path: $GS_ABS"
+
+
+
+
+
+
+
+# Replace only the gs_path line
+
+
+
+sed -i "s|^\(.*gs_path *= *\).*|\1$GS_ABS|" control.inp
+
+
+
+
+
+
+
+############################################
+
+
+
+# Remove stale JOB_TO_BE_KILLED if present
+
+
+
+############################################
+
+
+
+if [ -f "JOB_TO_BE_KILLED" ]; then
+
+
+
+    echo "Found stale JOB_TO_BE_KILLED file from a previous run. Deleting..."
+
+
+
+    rm -f "JOB_TO_BE_KILLED"
+
+
+
+fi
+
+
+
+
+
+
+
+############################################
+
+
+
+# Walltime signal handling
+
+
+
+############################################
+
+
+
+handle_usr1() {
+
+
+
+    echo "[$(date)] 30 minutes remaining. Creating JOB_TO_BE_KILLED file."
+
+
+
+    touch "JOB_TO_BE_KILLED"
+
+
+
+
+
+
+
+    (
+
+
+
+        sleep 1200   # 20 minutes (leaves 10 minutes remaining)
+
+
+
+        if [ -n "${MPI_PID:-}" ] && kill -0 "$MPI_PID" 2>/dev/null; then
+
+
+
+            echo "[$(date)] 10 minutes remaining. Forcing MPI termination."
+
+
+
+            kill -TERM "$MPI_PID"
+
+
+
+        fi
+
+
+
+    ) &
+
+
+
+}
+
+
+
+trap 'handle_usr1' USR1
+
+
+
+
+
+
+
+############################################
+
+
+
+# Job information banner
+
+
+
+############################################
+
+
+
+echo "=============================================="
+
+
+
+echo "SLURM Job ID        : $SLURM_JOB_ID"
+
+
+
+echo "Running on node(s)  : $SLURM_JOB_NODELIST"
+
+
+
+echo "Hostname (this node): $(hostname)"
+echo "Working directory   : $(pwd)"
+echo "=============================================="
+############################################
+# Run MPI job
+############################################
+run_code
+# wait might be interrupted by the signal trap; second wait catches it
+wait "$MPI_PID"
+wait "$MPI_PID"
+MPI_EXIT_CODE=$?
+echo "MPI job finished with exit code $MPI_EXIT_CODE"
+############################################
+# Copy results back
+############################################
+echo "Copying results back to original directory..."
+rsync -a --exclude control.inp --exclude 'slurm-*' "$SCRATCH_BASE/" "$ORIG_DIR/"
+echo "Cleanup complete."
+exit "$MPI_EXIT_CODE"
